@@ -37,7 +37,7 @@ SYMBOLS = [
 
 # Có thể chạy 1 hoặc nhiều khung thời gian cùng lúc, ví dụ: ["5m"] hoặc ["5m", "15m"]
 TIMEFRAMES   = ["5m"]
-MARKET_TYPE  = "future"     # "future" (OKX USDT-M Swap) hoặc "spot"
+MARKET_TYPE  = "spot"     # "future" (OKX USDT-M Swap) hoặc "spot"
 
 SWING_LENGTH = 6            # Khớp với thông số trong testsystem.py
 RISK_REWARD  = 2.0          # Tỷ lệ R:R = 1:2
