@@ -1,29 +1,42 @@
-name: SMC Signal Bot 24/7
+name: SMC OKX Signal Bot
 
 on:
   schedule:
-    # Chạy tự động mỗi 5 phút (24/7)
-    - cron: '*/5 * * * *'
-  workflow_dispatch: # Cho phép bấm nút chạy thử ngay lập tức trên giao diện GitHub
+    - cron: '*/5 * * * *' # Chạy định kỳ mỗi 5 phút khớp với khung 5m
+  workflow_dispatch:
+
+permissions:
+  contents: write # Cấp quyền để bot tự lưu file trạng thái lệnh vào Repo
 
 jobs:
   scan_smc_signal:
     runs-on: ubuntu-latest
     steps:
-      - name: 1. Tải mã nguồn từ Repo
+      - name: 1. Tải code từ Repo
         uses: actions/checkout@v4
 
-      - name: 2. Cài đặt Python 3.10 & Cache thư viện
+      - name: 2. Cài đặt Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip' # Lưu cache để lần chạy sau không tốn thời gian tải lại thư viện
+          cache: 'pip'
 
-      - name: 3. Cài đặt các gói trong requirements.txt
-        run: pip install -r requirements.txt
+      - name: 3. Cài đặt thư viện
+        run: pip install smartmoneyconcepts pandas numpy ccxt aiohttp
 
-      - name: 4. Quét thị trường & Bắn tín hiệu SMC
+      - name: 4. Chạy Bot quét tín hiệu OKX (Chế độ RUN_ONCE)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python smc_signal.py
+          RUN_ONCE: "true"
+        run: python bot_signal.py
+
+      - name: 5. Lưu trạng thái lệnh (live_multi_active_trades.json) cho lần chạy sau
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -f live_multi_active_trades.json ]; then
+            git add live_multi_active_trades.json
+            git diff --staged --quiet || git commit -m "Update active trades state [skip ci]"
+            git push
+          fi

@@ -32,7 +32,7 @@ RUN_ONCE = os.environ.get("RUN_ONCE", "false").lower() in ("1", "true", "yes")
 # Danh sách các cặp coin theo dõi đồng thời
 SYMBOLS = [
     "BTC/USDT",
-    "XAUT/USDT",
+    "PAXG/USDT",
 ]
 
 # Có thể chạy 1 hoặc nhiều khung thời gian cùng lúc, ví dụ: ["5m"] hoặc ["5m", "15m"]
