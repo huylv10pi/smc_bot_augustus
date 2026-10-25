@@ -30,7 +30,7 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 # Danh sách các cặp coin theo dõi đồng thời
 SYMBOLS = [
     "BTC/USDT",
-    "PAXG/USDT,
+    "XAUT/USDT",
 ]
 
 # Có thể chạy 1 hoặc nhiều khung thời gian cùng lúc, ví dụ: ["5m"] hoặc ["5m", "15m"]
