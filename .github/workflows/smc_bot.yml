@@ -1,0 +1,29 @@
+name: SMC Signal Bot 24/7
+
+on:
+  schedule:
+    # Chạy tự động mỗi 5 phút (24/7)
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # Cho phép bấm nút chạy thử ngay lập tức trên giao diện GitHub
+
+jobs:
+  scan_smc_signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Tải mã nguồn từ Repo
+        uses: actions/checkout@v4
+
+      - name: 2. Cài đặt Python 3.10 & Cache thư viện
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip' # Lưu cache để lần chạy sau không tốn thời gian tải lại thư viện
+
+      - name: 3. Cài đặt các gói trong requirements.txt
+        run: pip install -r requirements.txt
+
+      - name: 4. Quét thị trường & Bắn tín hiệu SMC
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python smc_signal.py

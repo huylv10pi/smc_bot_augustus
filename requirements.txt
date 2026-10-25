@@ -1,0 +1,6 @@
+smartmoneyconcepts
+pandas
+numpy
+ccxt
+yfinance
+requests
