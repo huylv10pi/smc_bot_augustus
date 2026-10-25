@@ -1,0 +1,34 @@
+{
+  "version": 2,
+  "config": {
+    "market_type": "spot",
+    "swing_length": 6,
+    "risk_reward": 2.0
+  },
+  "updated_at": "2026-10-25T16:53:18.704864+00:00",
+  "trackers": {
+    "BTC/USDT|5m": {
+      "active_trade": null,
+      "last_closed_open_ms": 1792946700000,
+      "wins": 0,
+      "losses": 0,
+      "cum_pnl_pct": 0.0
+    },
+    "PAXG/USDT|5m": {
+      "active_trade": {
+        "side": "BUY",
+        "entry": 4000.4,
+        "sl": 3992.0998974609374,
+        "tp": 4017.0002050781254,
+        "ob_top": 4000.60009765625,
+        "ob_bottom": 4000.10009765625,
+        "size_pct": 95.0,
+        "candle_time": "2026-10-25 08:20:00"
+      },
+      "last_closed_open_ms": 1792946700000,
+      "wins": 0,
+      "losses": 0,
+      "cum_pnl_pct": 0.0
+    }
+  }
+}
