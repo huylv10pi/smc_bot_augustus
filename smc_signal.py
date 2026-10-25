@@ -21,11 +21,13 @@ import pandas as pd
 from smartmoneyconcepts import smc
 
 # =====================================================================
-# 1. CẤU HÌNH BOT ĐA LUỒNG (MULTI-SYMBOL & MULTI-TIMEFRAME)
+# 1. CẤU HÌNH BOT ĐA LUỒNG (MULTI-SYMBOL & MULTI-TIMEFRAME) - SÀN OKX
 # =====================================================================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 
+# Đặt RUN_ONCE=true trên GitHub Actions nếu chỉ muốn quét 1 lượt rồi thoát
+RUN_ONCE = os.environ.get("RUN_ONCE", "false").lower() in ("1", "true", "yes")
 
 # Danh sách các cặp coin theo dõi đồng thời
 SYMBOLS = [
@@ -35,7 +37,7 @@ SYMBOLS = [
 
 # Có thể chạy 1 hoặc nhiều khung thời gian cùng lúc, ví dụ: ["5m"] hoặc ["5m", "15m"]
 TIMEFRAMES   = ["5m"]
-MARKET_TYPE  = "future"     # "future" (Binance USD-M Futures) hoặc "spot"
+MARKET_TYPE  = "future"     # "future" (OKX USDT-M Swap) hoặc "spot"
 
 SWING_LENGTH = 6            # Khớp với thông số trong testsystem.py
 RISK_REWARD  = 2.0          # Tỷ lệ R:R = 1:2
@@ -60,6 +62,37 @@ def parse_utc_ts(val) -> pd.Timestamp:
     if ts.tzinfo is not None:
         ts = ts.tz_convert("UTC").tz_localize(None)
     return ts
+
+
+# =====================================================================
+# HÀM CHUYỂN ĐỔI MÃ GIAO DỊCH & KÊNH WEBSOCKET CHUẨN SÀN OKX
+# =====================================================================
+def to_okx_ccxt_symbol(symbol: str) -> str:
+    """Chuyển 'BTC/USDT' -> 'BTC/USDT:USDT' (nếu là future/swap trên CCXT OKX)."""
+    base_sym = symbol.split(":")[0].strip().upper()
+    if MARKET_TYPE == "future":
+        return f"{base_sym}:USDT"
+    return base_sym
+
+
+def to_okx_inst_id(symbol: str) -> str:
+    """Chuyển 'BTC/USDT' -> 'BTC-USDT-SWAP' (future) hoặc 'BTC-USDT' (spot) cho OKX WebSocket."""
+    base_sym = symbol.split(":")[0].strip().upper().replace("/", "-")
+    if MARKET_TYPE == "future":
+        return f"{base_sym}-SWAP"
+    return base_sym
+
+
+def to_okx_ws_channel(timeframe: str) -> str:
+    """Chuyển timeframe ('5m', '15m', '1h', '4h', '1d') sang tên kênh candle của OKX WebSocket v5."""
+    tf = timeframe.strip()
+    if tf.endswith("m"):
+        return f"candle{tf}"
+    if tf.endswith(("h", "H")):
+        return f"candle{tf.upper()}"
+    if tf.endswith(("d", "D", "w", "W")):
+        return f"candle{tf.upper()}"
+    return f"candle{tf}"
 
 
 # =====================================================================
@@ -132,7 +165,6 @@ def load_active_trades(trackers: dict[str, MarketTracker]) -> int:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         by_key = {tr.key: tr for tr in trackers.values()}
 
-        # Định dạng mới (version 2) có kiểm tra khớp cấu hình chiến lược
         if isinstance(data, dict) and data.get("version") == 2:
             cfg = data.get("config", {})
             if (
@@ -157,7 +189,6 @@ def load_active_trades(trackers: dict[str, MarketTracker]) -> int:
                     trade["candle_time"] = str(parse_utc_ts(trade["candle_time"]))
                     tr.active_trade = trade
                     restored += 1
-        # Tương thích ngược với định dạng cũ (chỉ lưu dict {key: trade})
         elif isinstance(data, dict):
             for key, trade in data.items():
                 if key in by_key and isinstance(trade, dict) and "candle_time" in trade:
@@ -240,36 +271,68 @@ async def telegram_sender_worker(queue: asyncio.Queue):
 
 
 # =====================================================================
-# 5. TẢI DỮ LIỆU LỊCH SỬ ĐA LUỒNG & TÍNH SMC TRÊN THREAD POOL
+# 5. TẢI DỮ LIỆU LỊCH SỬ ĐA LUỒNG TỪ SÀN OKX & TÍNH SMC TRÊN THREAD POOL
 # =====================================================================
 def fetch_candles_with_live_sync(
     symbol: str, timeframe: str, limit: int = HISTORY_BARS
 ) -> tuple[pd.DataFrame, dict | None, int]:
     """
-    Tải các cây nến ĐÃ ĐÓNG gần nhất kèm cây nến ĐANG MỞ hiện tại cho 1 cặp
-    (chạy song song trên ThreadPoolExecutor, có tự thử lại khi mạng chập chờn).
+    Tải các cây nến ĐÃ ĐÓNG gần nhất kèm cây nến ĐANG MỞ hiện tại từ sàn OKX
+    (hỗ trợ phân trang tự động để lấy đủ 1000 nến vì mỗi request OKX tối đa 300 nến).
     """
-    exchange_cls = ccxt.binanceusdm if MARKET_TYPE == "future" else ccxt.binance
-    exchange = exchange_cls({"enableRateLimit": True})
+    exchange = ccxt.okx({
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": "swap" if MARKET_TYPE == "future" else "spot",
+        },
+    })
 
-    max_api_limit = 1500 if MARKET_TYPE == "future" else 1000
-    fetch_limit = min(limit + 1, max_api_limit)
+    ccxt_symbol = to_okx_ccxt_symbol(symbol)
+    tf_ms = int(exchange.parse_timeframe(timeframe) * 1000)
 
+    target_bars = limit + 1
+    per_page = 300  # Giới hạn tối đa mỗi lần gọi nến của OKX API v5
+    collected: list[list] = []
+    until_ms: int | None = None
     last_err = None
-    raw = None
-    for attempt in range(3):
-        try:
-            raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=fetch_limit)
-            if raw and len(raw) >= 50:
-                break
-        except Exception as e:
-            last_err = e
-            time.sleep(1.0 * (attempt + 1))
+
+    # Phân trang lùi về quá khứ qua tham số 'after' của OKX
+    max_pages = (target_bars // per_page) + 3
+    for _ in range(max_pages):
+        batch = None
+        for attempt in range(3):
+            try:
+                params = {"after": str(until_ms)} if until_ms is not None else {}
+                batch = exchange.fetch_ohlcv(
+                    ccxt_symbol,
+                    timeframe=timeframe,
+                    limit=per_page,
+                    params=params,
+                )
+                if batch:
+                    break
+            except Exception as e:
+                last_err = e
+                time.sleep(1.0 * (attempt + 1))
+
+        if not batch:
+            break
+
+        batch.sort(key=lambda x: int(x[0]))
+        collected = batch + collected
+        oldest_ts = int(batch[0][0])
+
+        if len(collected) >= target_bars or len(batch) < per_page // 2:
+            break
+        until_ms = oldest_ts
+
+    # Khử trùng lặp timestamp và sắp xếp tăng dần theo thời gian
+    dedup = {int(row[0]): row for row in collected}
+    raw = [dedup[k] for k in sorted(dedup.keys())]
 
     if not raw or len(raw) < 50:
-        raise RuntimeError(f"Không đủ dữ liệu lịch sử cho {symbol} ({timeframe}): {last_err}")
+        raise RuntimeError(f"Không đủ dữ liệu lịch sử từ OKX cho {symbol} ({timeframe}): {last_err}")
 
-    tf_ms = int(exchange.parse_timeframe(timeframe) * 1000)
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
     if int(raw[-1][0]) + tf_ms > now_ms:
@@ -402,7 +465,6 @@ def check_trade_exit(trade: dict, high: float, low: float) -> tuple[bool, bool, 
     if not (hit_sl or hit_tp):
         return False, False, 0.0, 0.0
 
-    # Nếu 1 nến quét cả SL và TP trong lúc mất mạng, ưu tiên tính SL để bảo toàn quản trị rủi ro
     if hit_sl:
         exit_price = sl
         hit_tp = False
@@ -534,11 +596,7 @@ def sync_one_tracker_sync(
     last_closed_open_ms: int,
 ) -> dict:
     """
-    Hàm đồng bộ & quét khôi phục lệnh chạy độc lập trên worker thread cho 1 cặp (Symbol + Timeframe):
-    - Khi mới khởi chạy (chưa có lịch sử xử lý): quét lại REPLAY_LOOKBACK_BARS nến đóng gần nhất
-      + nến đang mở hiện tại để phát hiện bất kỳ Entry nào đã khớp và hiện vẫn đang chạy.
-    - Khi kết nối lại sau gián đoạn: quét bù toàn bộ các nến đóng bị bỏ lỡ + nến đang mở hiện tại
-      để phát hiện lệnh chạm SL/TP hoặc Entry mới xuất hiện trong lúc mất kết nối.
+    Hàm đồng bộ & quét khôi phục lệnh chạy độc lập trên worker thread cho 1 cặp (Symbol + Timeframe).
     """
     df, live_bar, tf_ms = fetch_candles_with_live_sync(symbol, timeframe, limit=HISTORY_BARS)
     closed_outcomes: list[dict] = []
@@ -548,7 +606,6 @@ def sync_one_tracker_sync(
     if last_closed_open_ms > 0:
         last_processed_ts = pd.to_datetime(last_closed_open_ms, unit="ms")
     elif active_trade is not None and "candle_time" in active_trade:
-        # Hỗ trợ trường hợp đọc từ file trạng thái định dạng cũ chưa có last_closed_open_ms
         last_processed_ts = parse_utc_ts(active_trade["candle_time"])
     else:
         last_processed_ts = None
@@ -566,8 +623,6 @@ def sync_one_tracker_sync(
             if active_trade is not None:
                 hit_sl, hit_tp, _, _ = check_trade_exit(active_trade, h, l)
                 if hit_sl or hit_tp:
-                    # Đây là lệnh giả lập tái dựng từ lịch sử, không phải trạng thái
-                    # lệnh đã được bot xác nhận trước đó; không phát cảnh báo đóng lệnh cũ.
                     active_trade = None
                     trade_origin = "none"
 
@@ -577,7 +632,6 @@ def sync_one_tracker_sync(
                     active_trade = sig
                     trade_origin = "reconstructed"
 
-        # Nếu lệnh vừa khôi phục bị quét SL/TP bởi cây nến đang mở ngay trước khi lên danh sách khởi động
         if (
             active_trade is not None
             and live_bar is not None
@@ -587,7 +641,6 @@ def sync_one_tracker_sync(
                 active_trade, float(live_bar["high"]), float(live_bar["low"])
             )
             if hit_sl or hit_tp:
-                # Chỉ loại lệnh tái dựng; không phát cảnh báo cho giao dịch lịch sử.
                 active_trade = None
                 trade_origin = "none"
 
@@ -602,7 +655,6 @@ def sync_one_tracker_sync(
             if active_trade is not None and bar_ts > parse_utc_ts(active_trade["candle_time"]):
                 hit_sl, hit_tp, exit_price, pnl_pct = check_trade_exit(active_trade, h, l)
                 if hit_sl or hit_tp:
-                    # Luôn gửi thông báo SL/TP đối với mọi lệnh trong giai đoạn bù gap
                     closed_outcomes.append(
                         {
                             "trade": active_trade,
@@ -745,7 +797,7 @@ async def resync_single_tracker_gap(
 
 
 # =====================================================================
-# 7. ĐỒNG BỘ LỊCH SỬ SONG SONG & LẮNG NGHE COMBINED WEBSOCKET STREAM
+# 7. ĐỒNG BỘ LỊCH SỬ SONG SONG & LẮNG NGHE OKX WEBSOCKET V5 STREAM
 # =====================================================================
 async def sync_all_histories(
     trackers: dict[str, MarketTracker],
@@ -753,7 +805,6 @@ async def sync_all_histories(
 ) -> dict:
     """
     Tải song song dữ liệu mới nhất & khôi phục trạng thái lệnh đang chạy cho toàn bộ các cặp.
-    Trả về dict gồm exit_alerts (các lệnh đã đóng trong lúc mất mạng) và missed_keys (các cặp mới vào Entry).
     """
     loop = asyncio.get_running_loop()
 
@@ -811,13 +862,17 @@ async def sync_all_histories(
 
 
 async def run_multi_bot():
-    # Khởi tạo bộ theo dõi cho mọi tổ hợp (Symbol x Timeframe)
+    # Khởi tạo bộ theo dõi cho mọi tổ hợp (Symbol x Timeframe) chuẩn OKX
     trackers: dict[str, MarketTracker] = {}
+    subscribe_args: list[dict[str, str]] = []
+
     for sym in SYMBOLS:
-        clean_sym = sym.replace("/", "").lower()
+        inst_id = to_okx_inst_id(sym)
         for tf in TIMEFRAMES:
-            stream_name = f"{clean_sym}@kline_{tf}"
+            channel = to_okx_ws_channel(tf)
+            stream_name = f"{inst_id}|{channel}"
             trackers[stream_name] = MarketTracker(symbol=sym, timeframe=tf, stream_name=stream_name)
+            subscribe_args.append({"channel": channel, "instId": inst_id})
 
     restored_count = load_active_trades(trackers)
     if restored_count > 0:
@@ -825,7 +880,7 @@ async def run_multi_bot():
 
     tg_queue: asyncio.Queue = asyncio.Queue()
     print(
-        "[CONFIG] Telegram token: "
+        "[CONFIG] Sàn: OKX | Telegram token: "
         + ("đã cấu hình" if TELEGRAM_BOT_TOKEN and "YOUR_BOT_TOKEN" not in TELEGRAM_BOT_TOKEN else "THIẾU")
         + " | Chat ID: "
         + ("đã cấu hình" if TELEGRAM_CHAT_ID and "YOUR_CHAT_ID" not in TELEGRAM_CHAT_ID else "THIẾU")
@@ -841,9 +896,8 @@ async def run_multi_bot():
         task.add_done_callback(bg_tasks.discard)
         return task
 
-    streams_query = "/".join(trackers.keys())
-    ws_base = "wss://fstream.binance.com/stream" if MARKET_TYPE == "future" else "wss://stream.binance.com:9443/stream"
-    ws_url = f"{ws_base}?streams={streams_query}"
+    # Endpoint WebSocket cho dữ liệu nến (Klines/Candles) của OKX v5
+    ws_url = "wss://ws.okx.com:8443/ws/v5/business"
 
     has_started = False
     last_empty_reconnect_notify_ts = 0.0
@@ -853,11 +907,10 @@ async def run_multi_bot():
     try:
         while True:
             try:
-                # Đợi các tác vụ tính SMC nền còn dở hoàn tất trước khi đồng bộ lại
                 if bg_tasks:
                     await asyncio.gather(*list(bg_tasks), return_exceptions=True)
 
-                action_label = "Đang tải & quét lịch sử ban đầu" if not has_started else "Đang đồng bộ lại nến & kiểm tra lệnh sau gián đoạn"
+                action_label = "Đang tải & quét lịch sử OKX ban đầu" if not has_started else "Đang đồng bộ lại nến OKX & kiểm tra lệnh sau gián đoạn"
                 print(
                     f"\n[{action_label}] {len(trackers)} luồng ({len(SYMBOLS)} cặp x {len(TIMEFRAMES)} khung) "
                     f"trên {MAX_WORKERS} luồng CPU..."
@@ -865,14 +918,41 @@ async def run_multi_bot():
                 sync_res = await sync_all_histories(trackers, executor)
                 pending_exit_alerts.extend(sync_res["exit_alerts"])
                 pending_missed_keys.update(sync_res["missed_keys"])
-                # Loại bỏ khỏi danh sách missed_keys những cặp hiện không còn giữ lệnh
                 pending_missed_keys = {
                     tr.key for tr in trackers.values() if tr.active_trade is not None and tr.key in pending_missed_keys
                 }
 
+                # Nếu chạy trên GitHub Actions với RUN_ONCE=true: Gửi thông báo rồi thoát ngay
+                if RUN_ONCE:
+                    for alert_msg in pending_exit_alerts:
+                        print(f"\n{alert_msg}")
+                        await tg_queue.put(alert_msg)
+                    pending_exit_alerts.clear()
+
+                    active_items = [
+                        (tr, tr.key in pending_missed_keys)
+                        for tr in trackers.values()
+                        if tr.active_trade is not None
+                    ]
+                    if active_items:
+                        active_msgs = format_active_trades_messages(
+                            active_items,
+                            f"📌 <b>TRẠNG THÁI LỆNH SMC OKX ({len(active_items)})</b>",
+                        )
+                        for m in active_msgs:
+                            print(f"\n{m}")
+                            await tg_queue.put(m)
+
+                    await tg_queue.join()
+                    print("[RUN_ONCE] Đã hoàn tất quét lịch sử OKX và gửi thông báo.")
+                    break
+
                 async with aiohttp.ClientSession() as session:
                     async with session.ws_connect(ws_url, heartbeat=20) as ws:
-                        print(f"[WebSocket Đa Luồng] Đã kết nối {len(trackers)} streams trên 1 kênh gộp. Đang theo dõi realtime...")
+                        # Gửi gói tin đăng ký lắng nghe các kênh nến OKX
+                        sub_payload = {"op": "subscribe", "args": subscribe_args}
+                        await ws.send_json(sub_payload)
+                        print(f"[OKX WebSocket Đa Luồng] Đã kết nối & đăng ký {len(trackers)} kênh nến. Đang theo dõi realtime...")
 
                         # 1. Gửi thông báo đóng lệnh bù nếu có lệnh chạm SL/TP trong lúc mất kết nối
                         for alert_msg in pending_exit_alerts:
@@ -892,7 +972,7 @@ async def run_multi_bot():
                             pending_missed_keys.clear()
 
                             startup_msg = (
-                                f"🚀 <b>SMC Multi-Thread Bot đã khởi động!</b>\n"
+                                f"🚀 <b>SMC Multi-Thread Bot (OKX) đã khởi động!</b>\n"
                                 f"• Thị trường: <code>{MARKET_TYPE.upper()}</code> | Swing: <code>{SWING_LENGTH}</code> | R:R: <code>1:{RISK_REWARD}</code>\n"
                                 f"• Các cặp ({len(SYMBOLS)}): <code>{', '.join(SYMBOLS)}</code>\n"
                                 f"• Khung giờ: <code>{', '.join(TIMEFRAMES)}</code> | Luồng CPU: <code>{MAX_WORKERS}</code>\n"
@@ -913,9 +993,9 @@ async def run_multi_bot():
                             if active_items:
                                 has_new_missed = any(is_missed for _, is_missed in active_items)
                                 reconnect_header = (
-                                    f"🚨 <b>ĐÃ KẾT NỐI LẠI — PHÁT HIỆN ENTRY MỚI & LỆNH ĐANG CHẠY ({len(active_items)})</b>"
+                                    f"🚨 <b>ĐÃ KẾT NỐI LẠI OKX — PHÁT HIỆN ENTRY MỚI & LỆNH ĐANG CHẠY ({len(active_items)})</b>"
                                     if has_new_missed
-                                    else f"🔄 <b>ĐÃ KẾT NỐI LẠI — ĐANG CÓ {len(active_items)} LỆNH DIỄN RA</b>"
+                                    else f"🔄 <b>ĐÃ KẾT NỐI LẠI OKX — ĐANG CÓ {len(active_items)} LỆNH DIỄN RA</b>"
                                 )
                                 pending_missed_keys.clear()
                                 active_msgs = format_active_trades_messages(active_items, reconnect_header)
@@ -927,119 +1007,138 @@ async def run_multi_bot():
                                 if now_epoch - last_empty_reconnect_notify_ts >= 60:
                                     last_empty_reconnect_notify_ts = now_epoch
                                     reconnect_msg = (
-                                        f"🔄 <b>Đã kết nối lại WebSocket Đa Luồng</b> ({len(trackers)} streams)\n"
+                                        f"🔄 <b>Đã kết nối lại OKX WebSocket Đa Luồng</b> ({len(trackers)} streams)\n"
                                         f"• Trạng thái: <i>Hiện chưa có lệnh đang mở.</i>"
                                     )
                                     print(f"\n{reconnect_msg}")
                                     await tg_queue.put(reconnect_msg)
 
-                        # 3. Lắng nghe dữ liệu nến realtime của toàn bộ các cặp
+                        # 3. Lắng nghe dữ liệu nến realtime của toàn bộ các cặp từ OKX
                         async for msg in ws:
                             if msg.type != aiohttp.WSMsgType.TEXT:
                                 if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                                     break
                                 continue
 
+                            if msg.data == "pong":
+                                continue
+
                             payload = json.loads(msg.data)
-                            stream_name = payload.get("stream")
-                            event_data = payload.get("data", {})
-                            k = event_data.get("k")
-                            if not stream_name or not k or stream_name not in trackers:
+                            if "event" in payload:
+                                if payload.get("event") == "error":
+                                    print(f"[OKX WS Error]: {payload}")
+                                continue
+
+                            arg = payload.get("arg", {})
+                            data_list = payload.get("data", [])
+                            if not arg or not data_list:
+                                continue
+
+                            inst_id = arg.get("instId")
+                            channel = arg.get("channel")
+                            stream_name = f"{inst_id}|{channel}"
+                            if stream_name not in trackers:
                                 continue
 
                             tr = trackers[stream_name]
-                            live_high = float(k["h"])
-                            live_low = float(k["l"])
-                            live_close = float(k["c"])
-                            is_closed = bool(k["x"])
-                            open_time_ms = int(k["t"])
-                            tr.current_price = live_close
 
-                            # ---------------------------------------------------------
-                            # A. KIỂM TRA CHẠM SL / TP TỨC THỜI CHO TỪNG CẶP ĐANG MỞ LỆNH
-                            # (Ưu tiên kiểm tra trước khi xử lý resync gap để không nuốt SL/TP)
-                            # ---------------------------------------------------------
-                            if tr.active_trade is not None:
-                                trade_open_ms = ts_to_ms(parse_utc_ts(tr.active_trade["candle_time"]))
-                                if open_time_ms > trade_open_ms:
-                                    hit_sl, hit_tp, exit_price, pnl_pct = check_trade_exit(
-                                        tr.active_trade, live_high, live_low
-                                    )
-                                    if hit_sl or hit_tp:
-                                        print(
-                                            f"[TP/SL HIT] {tr.symbol} {tr.timeframe} "
-                                            f"side={tr.active_trade['side']} "
-                                            f"high={fmt_price(live_high)} low={fmt_price(live_low)} "
-                                            f"SL={fmt_price(float(tr.active_trade['sl']))} "
-                                            f"TP={fmt_price(float(tr.active_trade['tp']))}"
+                            # Cấu trúc mảng nến OKX: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
+                            for k in data_list:
+                                open_time_ms = int(k[0])
+                                live_open = float(k[1])
+                                live_high = float(k[2])
+                                live_low = float(k[3])
+                                live_close = float(k[4])
+                                live_vol = float(k[5])
+                                is_closed = str(k[8]) == "1"
+                                tr.current_price = live_close
+
+                                # ---------------------------------------------------------
+                                # A. KIỂM TRA CHẠM SL / TP TỨC THỜI CHO TỪNG CẶP ĐANG MỞ LỆNH
+                                # ---------------------------------------------------------
+                                if tr.active_trade is not None:
+                                    trade_open_ms = ts_to_ms(parse_utc_ts(tr.active_trade["candle_time"]))
+                                    if open_time_ms > trade_open_ms:
+                                        hit_sl, hit_tp, exit_price, pnl_pct = check_trade_exit(
+                                            tr.active_trade, live_high, live_low
                                         )
-                                        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                                        alert_exit = record_and_format_exit_alert(
-                                            tr,
-                                            tr.active_trade,
-                                            exit_price,
-                                            pnl_pct,
-                                            hit_tp,
-                                            now_str,
-                                        )
-                                        print(f"\n{alert_exit}")
-                                        tr.active_trade = None
-                                        save_active_trades(trackers)
-                                        await tg_queue.put(alert_exit)
+                                        if hit_sl or hit_tp:
+                                            print(
+                                                f"[TP/SL HIT] {tr.symbol} {tr.timeframe} "
+                                                f"side={tr.active_trade['side']} "
+                                                f"high={fmt_price(live_high)} low={fmt_price(live_low)} "
+                                                f"SL={fmt_price(float(tr.active_trade['sl']))} "
+                                                f"TP={fmt_price(float(tr.active_trade['tp']))}"
+                                            )
+                                            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                                            alert_exit = record_and_format_exit_alert(
+                                                tr,
+                                                tr.active_trade,
+                                                exit_price,
+                                                pnl_pct,
+                                                hit_tp,
+                                                now_str,
+                                            )
+                                            print(f"\n{alert_exit}")
+                                            tr.active_trade = None
+                                            save_active_trades(trackers)
+                                            await tg_queue.put(alert_exit)
 
-                            # Phòng trường hợp có nến đóng đúng vào tích tắc bắt tay WebSocket
-                            if open_time_ms > tr.last_closed_open_ms + tr.tf_ms and not tr.resyncing:
-                                _spawn_bg_task(
-                                    resync_single_tracker_gap(
-                                        tracker=tr,
-                                        executor=executor,
-                                        tg_queue=tg_queue,
-                                        all_trackers=trackers,
-                                    )
-                                )
-                                continue
-
-                            # ---------------------------------------------------------
-                            # B. KHI NẾN ĐÓNG -> ĐẨY SANG THREAD POOL TÍNH SMC SONG SONG
-                            # ---------------------------------------------------------
-                            if is_closed and open_time_ms > tr.last_closed_open_ms:
-                                tr.last_closed_open_ms = open_time_ms
-                                bar_ts = pd.to_datetime(open_time_ms, unit="ms")
-
-                                tr.df.loc[bar_ts] = [
-                                    float(k["o"]),
-                                    live_high,
-                                    live_low,
-                                    live_close,
-                                    float(k["v"]),
-                                ]
-                                if len(tr.df) > HISTORY_BARS:
-                                    tr.df = tr.df.iloc[-HISTORY_BARS:]
-
-                                save_active_trades(trackers)
-
-                                status_str = tr.active_trade["side"] if tr.active_trade else "Trống"
-                                print(f"[{bar_ts}] {tr.symbol:<9} ({tr.timeframe}) đóng nến @ {fmt_price(live_close)} | Vị thế: {status_str}")
-
-                                if tr.active_trade is None and not tr.calculating and not tr.resyncing:
+                                # Phòng trường hợp có nến đóng đúng vào tích tắc bắt tay WebSocket
+                                if open_time_ms > tr.last_closed_open_ms + tr.tf_ms and not tr.resyncing:
                                     _spawn_bg_task(
-                                        process_closed_bar_signal(
+                                        resync_single_tracker_gap(
                                             tracker=tr,
-                                            df_snapshot=tr.df.copy(),
-                                            bar_ts=bar_ts,
                                             executor=executor,
                                             tg_queue=tg_queue,
                                             all_trackers=trackers,
                                         )
                                     )
+                                    continue
 
-                print("[WebSocket Đa Luồng] Kết nối đã đóng. Tự động kết nối & đồng bộ lại sau 3 giây...")
+                                # ---------------------------------------------------------
+                                # B. KHI NẾN ĐÓNG (confirm == "1") -> TÍNH SMC SONG SONG
+                                # ---------------------------------------------------------
+                                if is_closed and open_time_ms > tr.last_closed_open_ms:
+                                    tr.last_closed_open_ms = open_time_ms
+                                    bar_ts = pd.to_datetime(open_time_ms, unit="ms")
+
+                                    tr.df.loc[bar_ts] = [
+                                        live_open,
+                                        live_high,
+                                        live_low,
+                                        live_close,
+                                        live_vol,
+                                    ]
+                                    if len(tr.df) > HISTORY_BARS:
+                                        tr.df = tr.df.iloc[-HISTORY_BARS:]
+
+                                    save_active_trades(trackers)
+
+                                    status_str = tr.active_trade["side"] if tr.active_trade else "Trống"
+                                    print(f"[{bar_ts}] {tr.symbol:<9} ({tr.timeframe}) đóng nến @ {fmt_price(live_close)} | Vị thế: {status_str}")
+
+                                    if tr.active_trade is None and not tr.calculating and not tr.resyncing:
+                                        _spawn_bg_task(
+                                            process_closed_bar_signal(
+                                                tracker=tr,
+                                                df_snapshot=tr.df.copy(),
+                                                bar_ts=bar_ts,
+                                                executor=executor,
+                                                tg_queue=tg_queue,
+                                                all_trackers=trackers,
+                                            )
+                                        )
+
+                print("[OKX WebSocket Đa Luồng] Kết nối đã đóng. Tự động kết nối & đồng bộ lại sau 3 giây...")
                 await asyncio.sleep(3)
 
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                print(f"[Mất kết nối WebSocket] {e}. Tự động kết nối & đồng bộ lại sau 5 giây...")
+                print(f"[Mất kết nối WebSocket OKX] {e}. Tự động kết nối & đồng bộ lại sau 5 giây...")
+                if RUN_ONCE:
+                    break
                 await asyncio.sleep(5)
     finally:
         for task in list(bg_tasks):
