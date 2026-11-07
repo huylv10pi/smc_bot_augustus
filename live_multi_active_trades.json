@@ -5,7 +5,7 @@
     "swing_length": 6,
     "risk_reward": 2.0
   },
-  "updated_at": "2026-11-07T14:12:22.309004+00:00",
+  "updated_at": "2026-11-07T18:50:25.517210+00:00",
   "trackers": {
     "BTC/USDT|5m": {
       "active_trade": {
@@ -18,7 +18,7 @@
         "size_pct": 95.0,
         "candle_time": "2026-11-06 16:50:00"
       },
-      "last_closed_open_ms": 1794060300000,
+      "last_closed_open_ms": 1794077100000,
       "wins": 10,
       "losses": 26,
       "cum_pnl_pct": -1.9518228633830281
@@ -34,7 +34,7 @@
         "size_pct": 95.0,
         "candle_time": "2026-11-07 00:15:00"
       },
-      "last_closed_open_ms": 1794060300000,
+      "last_closed_open_ms": 1794077100000,
       "wins": 9,
       "losses": 17,
       "cum_pnl_pct": 0.04818059676536332
