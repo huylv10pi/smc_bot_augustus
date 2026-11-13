@@ -5,7 +5,7 @@
     "swing_length": 6,
     "risk_reward": 2.0
   },
-  "updated_at": "2026-11-13T18:15:51.114009+00:00",
+  "updated_at": "2026-11-13T23:42:06.023488+00:00",
   "trackers": {
     "BTC/USDT|5m": {
       "active_trade": {
@@ -18,14 +18,14 @@
         "size_pct": 95.0,
         "candle_time": "2026-11-13 08:15:00"
       },
-      "last_closed_open_ms": 1794593400000,
+      "last_closed_open_ms": 1794612900000,
       "wins": 14,
       "losses": 39,
       "cum_pnl_pct": -3.2259968792932865
     },
     "PAXG/USDT|5m": {
       "active_trade": null,
-      "last_closed_open_ms": 1794593400000,
+      "last_closed_open_ms": 1794612900000,
       "wins": 13,
       "losses": 23,
       "cum_pnl_pct": 3.3007660204965688
